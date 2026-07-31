@@ -19,7 +19,7 @@ import { getProjectDir, logger, sanitizeText } from "@gajae-code/utils";
 import { EDIT_MODE_STRATEGIES, type EditMode, type PerFileDiffPreview } from "../../edit";
 import type { Theme } from "../../modes/theme/theme";
 import { theme } from "../../modes/theme/theme";
-import type { StreamingOutputDelta } from "../../session/streaming-output";
+import { BoundedStreamingOutput, DEFAULT_MAX_BYTES, type StreamingOutputDelta } from "../../session/streaming-output";
 import { BASH_DEFAULT_PREVIEW_LINES } from "../../tools/bash";
 import { EVAL_DEFAULT_PREVIEW_LINES } from "../../tools/eval";
 import {
@@ -221,7 +221,7 @@ export class ToolExecutionComponent extends Container {
 	#editAllowFuzzy: boolean | undefined;
 	#hashlineAutoDropPureInsertDuplicates: boolean | undefined;
 	#isPartial = true;
-	#streamingOutput = "";
+	#streamingOutput = new BoundedStreamingOutput(DEFAULT_MAX_BYTES);
 	#tool?: AgentTool;
 	#ui: TUI;
 	#cwd: string;
@@ -416,7 +416,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.#toolName === "bash" && isPartial) {
 			const delta = readStreamingOutputDelta(result.details);
 			if (delta?.kind === "append") {
-				this.#streamingOutput += sanitizeWithOptionalSixelPassthrough(delta.text, sanitizeText);
+				this.#streamingOutput.append(sanitizeWithOptionalSixelPassthrough(delta.text, sanitizeText));
 			}
 		}
 		this.#result = result;
@@ -902,16 +902,17 @@ export class ToolExecutionComponent extends Container {
 			// plus this context to keep the inline command preview visible while tool-call JSON is still streaming.
 			if (this.#result) {
 				// Pass raw output and expanded state - renderer handles width-aware truncation
+				const retainedStreamingOutput = this.#streamingOutput.text();
 				const streamedOutput =
-					this.#streamingOutput.length > 0
+					retainedStreamingOutput.length > 0
 						? isTerminalGraphicsFallbackActive()
-							? replaceSixelOutputForGraphicsFallback(this.#streamingOutput)
-							: this.#streamingOutput
+							? replaceSixelOutputForGraphicsFallback(retainedStreamingOutput)
+							: retainedStreamingOutput
 						: undefined;
 				const useStreamedOutput = this.#expanded && streamedOutput !== undefined;
 				const output = (useStreamedOutput ? streamedOutput : this.#getTextOutput()).trimEnd();
 				context.output = output;
-				if (useStreamedOutput) context.isFullOutput = true;
+				if (useStreamedOutput && !this.#streamingOutput.truncated) context.isFullOutput = true;
 			}
 			context.expanded = this.#expanded;
 			context.previewLines = BASH_DEFAULT_PREVIEW_LINES;

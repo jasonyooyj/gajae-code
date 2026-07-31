@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	BoundedStreamingOutput,
 	createStreamOutputUpdates,
+	DEFAULT_MAX_BYTES,
 	formatHeadTruncationNotice,
 	formatMiddleElisionMarker,
 	formatTailTruncationNotice,
@@ -208,6 +210,50 @@ describe("TailBuffer", () => {
 		expect(updates).toHaveLength(2);
 		expect(updates.map(update => update.delta?.text).join("")).toBe("head\nmiddle\ntail\n");
 		expect(updates[1]?.snapshot).toBe("tail\n");
+	});
+
+	test("bounds queued renderer deltas without dropping source text", () => {
+		const deltas: string[] = [];
+		const callbacks = createStreamOutputUpdates<{ streamingOutput: StreamingOutputDelta }>(
+			new TailBuffer(32),
+			update => {
+				if (update.details?.streamingOutput.text) deltas.push(update.details.streamingOutput.text);
+			},
+			text => ({ streamingOutput: { kind: "append", text } }),
+		);
+		const source = `head-${"界".repeat(DEFAULT_MAX_BYTES)}-tail`;
+
+		callbacks.onRawChunk(source);
+		callbacks.flush();
+
+		expect(deltas.join("")).toBe(source);
+		expect(deltas.length).toBeGreaterThan(1);
+		expect(deltas.every(delta => byteLength(delta) <= DEFAULT_MAX_BYTES)).toBe(true);
+	});
+});
+
+describe("BoundedStreamingOutput", () => {
+	test("keeps ordinary output complete within the shared display budget", () => {
+		const output = new BoundedStreamingOutput(64);
+		output.append("head😀");
+		output.append("\nmiddle\ntail");
+
+		expect(output.text()).toBe("head😀\nmiddle\ntail");
+		expect(output.truncated).toBe(false);
+	});
+
+	test("retains a bounded head and tail with an explicit middle marker", () => {
+		const output = new BoundedStreamingOutput(64);
+		const source = `HEAD\n${"middle\n".repeat(40)}TAIL`;
+		output.append(source);
+		const retained = output.text();
+
+		expect(output.truncated).toBe(true);
+		expect(output.totalBytes).toBe(byteLength(source));
+		expect(retained).toContain("HEAD");
+		expect(retained).toContain("TAIL");
+		expect(retained).toContain("elided");
+		expect(byteLength(retained)).toBeLessThan(192);
 	});
 });
 

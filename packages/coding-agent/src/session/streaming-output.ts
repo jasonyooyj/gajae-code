@@ -934,6 +934,90 @@ export class TailBuffer {
 	}
 }
 
+/**
+ * Bounded head-and-tail retention for interactive streaming output.
+ *
+ * Ordinary output remains byte-for-byte complete while it fits within the
+ * shared display budget. Once the budget is exceeded, the middle is replaced
+ * with an explicit marker while subsequent chunks continue to refresh the
+ * retained tail. This keeps transcript components bounded without silently
+ * dropping the start or the most recent output.
+ */
+export class BoundedStreamingOutput {
+	#head = "";
+	#headBytes = 0;
+	#headSealed = false;
+	#tail: TailBuffer;
+	#totalBytes = 0;
+	#totalNewlines = 0;
+	#cachedText?: string;
+	readonly #headLimit: number;
+
+	constructor(maxBytes = DEFAULT_MAX_BYTES) {
+		const boundedMaxBytes = Math.max(0, Math.floor(maxBytes));
+		this.#headLimit = Math.floor(boundedMaxBytes / 2);
+		this.#tail = new TailBuffer(boundedMaxBytes - this.#headLimit);
+	}
+
+	get hasOutput(): boolean {
+		return this.#totalBytes > 0;
+	}
+
+	get totalBytes(): number {
+		return this.#totalBytes;
+	}
+
+	get truncated(): boolean {
+		return this.#totalBytes > this.#headBytes + this.#tail.bytes();
+	}
+
+	append(text: string): void {
+		if (text.length === 0) return;
+		const bytes = Buffer.byteLength(text, "utf-8");
+		this.#totalBytes += bytes;
+		this.#totalNewlines += countNewlines(text);
+		this.#cachedText = undefined;
+
+		if (!this.#headSealed && this.#headBytes < this.#headLimit) {
+			const room = this.#headLimit - this.#headBytes;
+			if (bytes <= room) {
+				this.#head += text;
+				this.#headBytes += bytes;
+				return;
+			}
+
+			const retained = truncateHeadBytes(text, room);
+			this.#head += retained.text;
+			this.#headBytes += retained.bytes;
+			this.#headSealed = true;
+			this.#tail.append(text.slice(retained.text.length));
+			return;
+		}
+
+		this.#headSealed = true;
+		this.#tail.append(text);
+	}
+
+	text(): string {
+		if (this.#cachedText !== undefined) return this.#cachedText;
+
+		const tail = this.#tail.text();
+		const tailBytes = Buffer.byteLength(tail, "utf-8");
+		const elidedBytes = Math.max(0, this.#totalBytes - this.#headBytes - tailBytes);
+		if (elidedBytes === 0) {
+			this.#cachedText = `${this.#head}${tail}`;
+			return this.#cachedText;
+		}
+
+		const elidedLines = Math.max(0, this.#totalNewlines - countNewlines(this.#head) - countNewlines(tail));
+		const marker = formatMiddleElisionMarker(elidedLines, elidedBytes);
+		const headSeparator = this.#head.length === 0 || this.#head.endsWith("\n") ? "" : "\n";
+		const tailSeparator = tail.length === 0 || tail.startsWith("\n") ? "" : "\n";
+		this.#cachedText = `${this.#head}${headSeparator}${marker}${tailSeparator}${tail}`;
+		return this.#cachedText;
+	}
+}
+
 // =============================================================================
 // OutputSink — line-buffered output with file spill support
 // =============================================================================
@@ -1630,31 +1714,59 @@ export function createStreamOutputUpdates<TDetails, TInput = unknown>(
 	}
 
 	let pending: string[] = [];
+	let pendingBytes = 0;
+	let sawRawChunkSincePreview = false;
 
 	const flush = (): void => {
 		if (pending.length === 0) return;
 		const delta = pending.join("");
 		pending = [];
+		pendingBytes = 0;
 		onUpdate({
 			content: [{ type: "text", text: tailBuffer.text() }],
 			details: createDetails(delta),
 		});
 	};
 
+	const queue = (chunk: string): void => {
+		let remaining = chunk;
+		while (remaining.length > 0) {
+			if (pendingBytes >= DEFAULT_MAX_BYTES) flush();
+			const room = DEFAULT_MAX_BYTES - pendingBytes;
+			let retained = truncateHeadBytes(remaining, room);
+			if (retained.text.length === 0) {
+				if (pendingBytes > 0) {
+					flush();
+					continue;
+				}
+				const codePoint = remaining.codePointAt(0);
+				if (codePoint === undefined) return;
+				const first = String.fromCodePoint(codePoint);
+				retained = { text: first, bytes: Buffer.byteLength(first, "utf-8") };
+			}
+			pending.push(retained.text);
+			pendingBytes += retained.bytes;
+			remaining = remaining.slice(retained.text.length);
+			if (pendingBytes >= DEFAULT_MAX_BYTES) flush();
+		}
+	};
+
 	return {
 		onRawChunk: chunk => {
 			if (chunk.length === 0) return;
+			sawRawChunkSincePreview = true;
 			tailBuffer.append(chunk);
-			pending.push(chunk);
+			queue(chunk);
 		},
 		onChunk: chunk => {
 			// Keep compatibility with callers/tests that provide only onChunk. In
-			// the normal executor path onRawChunk runs first, so this branch does
-			// not duplicate data.
-			if (pending.length === 0 && chunk.length > 0) {
+			// the normal executor path onRawChunk runs first, so do not duplicate
+			// data even when the bounded queue already auto-flushed.
+			if (!sawRawChunkSincePreview && chunk.length > 0) {
 				tailBuffer.append(chunk);
-				pending.push(chunk);
+				queue(chunk);
 			}
+			sawRawChunkSincePreview = false;
 			flush();
 		},
 		flush,

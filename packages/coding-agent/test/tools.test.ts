@@ -1613,6 +1613,44 @@ function b() {
 			await asyncJobManager.dispose();
 		});
 
+		it("should forward complete renderer deltas through the managed foreground path", async () => {
+			const asyncJobManager = new AsyncJobManager({ onJobComplete: async () => {} });
+			AsyncJobManager.setInstance(asyncJobManager);
+			try {
+				const managedTool = new BashTool(
+					createTestToolSession(
+						testDir,
+						Settings.isolated({
+							"bash.autoBackground.enabled": false,
+						}),
+						{ getSessionId: () => "managed-renderer-deltas" },
+					),
+				);
+				const expected = `${Array.from(
+					{ length: 400 },
+					(_, index) => `managed-line-${String(index).padStart(3, "0")}`,
+				).join("\n")}\n`;
+				const deltas: string[] = [];
+
+				const result = await managedTool.execute(
+					"managed-renderer-deltas",
+					{ command: "for i in $(seq 0 399); do printf 'managed-line-%03d\\n' \"$i\"; done" },
+					undefined,
+					update => {
+						const delta = update.details?.streamingOutput;
+						if (delta?.kind === "append") deltas.push(delta.text);
+					},
+				);
+
+				expect(deltas.join("")).toBe(expected);
+				expect(getTextOutput(result)).toContain("managed-line-399");
+				expect(result.details?.async).toBeUndefined();
+			} finally {
+				await asyncJobManager.dispose();
+				AsyncJobManager.setInstance(undefined);
+			}
+		});
+
 		it("should fold a managed foreground command into a background job when requested", async () => {
 			const deliveries: Array<{ jobId: string; text: string }> = [];
 			const updates: Array<{ text: string; asyncState?: string }> = [];

@@ -16,6 +16,7 @@ import {
 } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
+import { BoundedStreamingOutput, DEFAULT_MAX_BYTES } from "../../session/streaming-output";
 import type { TruncationMeta } from "../../tools/output-meta";
 import {
 	containsSixelSequence,
@@ -41,10 +42,8 @@ const CHUNK_THROTTLE_MS = 50;
 
 export class BashExecutionComponent extends Container {
 	#outputLines: string[] = [];
-	#fullOutputChunks: string[] = [];
-	#fullOutputText?: string;
+	#fullOutput = new BoundedStreamingOutput(DEFAULT_MAX_BYTES);
 	#fullOutputLines?: string[];
-	#pendingOutputChunks: string[] = [];
 	#flushTimer?: NodeJS.Timeout;
 	#status: ExecutionStatus = "running";
 	#exitCode: number | undefined = undefined;
@@ -103,42 +102,19 @@ export class BashExecutionComponent extends Container {
 		const clean = sanitizeWithOptionalSixelPassthrough(chunk, sanitizeText);
 		if (clean.length === 0) return;
 
-		// Keep every chunk for expanded output. Only the preview update is
-		// throttled; dropping chunks here makes live output lose arbitrary middle
-		// sections even when the executor captured them successfully.
-		this.#fullOutputChunks.push(clean);
-		this.#fullOutputText = undefined;
+		// Preserve ordinary streams up to the shared display budget and retain an
+		// explicit head/tail view beyond it. Only display rebuilding is throttled.
+		this.#fullOutput.append(clean);
 		this.#fullOutputLines = undefined;
-		this.#pendingOutputChunks.push(clean);
 		if (this.#flushTimer) return;
 		this.#flushTimer = setTimeout(() => {
 			this.#flushTimer = undefined;
-			this.#flushPendingOutput();
+			this.#flushStreamingDisplay();
 		}, CHUNK_THROTTLE_MS);
 	}
 
-	#flushPendingOutput(): void {
-		if (this.#pendingOutputChunks.length === 0) return;
-		const chunk = this.#pendingOutputChunks.join("");
-		this.#pendingOutputChunks = [];
-
-		const incomingLines = chunk.split("\n");
-		if (this.#outputLines.length > 0 && incomingLines.length > 0) {
-			const lastIndex = this.#outputLines.length - 1;
-			const mergedLines = [`${this.#outputLines[lastIndex]}${incomingLines[0]}`, ...incomingLines.slice(1)];
-			const clampedMergedLines = this.#clampLinesPreservingSixel(mergedLines);
-			this.#outputLines[lastIndex] = clampedMergedLines[0] ?? "";
-			this.#outputLines.push(...clampedMergedLines.slice(1));
-		} else {
-			this.#outputLines.push(...this.#clampLinesPreservingSixel(incomingLines));
-		}
-
-		// Keep the collapsed preview bounded. The complete stream remains in
-		// #fullOutputChunks for expanded rendering and getOutput().
-		if (this.#outputLines.length > STREAMING_PREVIEW_LINE_CAP) {
-			this.#outputLines = this.#outputLines.slice(-STREAMING_PREVIEW_LINE_CAP);
-		}
-
+	#flushStreamingDisplay(): void {
+		this.#outputLines = this.#getFullOutputLines().slice(-STREAMING_PREVIEW_LINE_CAP);
 		this.#displayDirty = true;
 		this.#ui.requestRender();
 	}
@@ -152,11 +128,11 @@ export class BashExecutionComponent extends Container {
 			clearTimeout(this.#flushTimer);
 			this.#flushTimer = undefined;
 		}
-		this.#flushPendingOutput();
+		this.#flushStreamingDisplay();
 		this.#exitCode = exitCode;
 		this.#status = resolveExecutionStatus(exitCode, cancelled);
 		this.#truncation = options?.truncation;
-		if (options?.output !== undefined && this.#fullOutputChunks.length === 0) {
+		if (options?.output !== undefined && !this.#fullOutput.hasOutput) {
 			this.#setOutput(options.output);
 		}
 
@@ -180,7 +156,6 @@ export class BashExecutionComponent extends Container {
 			clearTimeout(this.#flushTimer);
 			this.#flushTimer = undefined;
 		}
-		this.#pendingOutputChunks = [];
 		super.dispose();
 	}
 
@@ -277,22 +252,15 @@ export class BashExecutionComponent extends Container {
 
 	#setOutput(output: string): void {
 		const clean = sanitizeWithOptionalSixelPassthrough(output, sanitizeText);
-		this.#fullOutputChunks = clean ? [clean] : [];
-		this.#fullOutputText = clean;
-		this.#fullOutputLines = clean ? this.#clampLinesPreservingSixel(clean.split("\n")) : [];
-		this.#outputLines = this.#fullOutputLines.slice(-STREAMING_PREVIEW_LINE_CAP);
-	}
-
-	#getFullOutput(): string {
-		if (this.#fullOutputText === undefined) {
-			this.#fullOutputText = this.#fullOutputChunks.join("");
-		}
-		return this.#fullOutputText;
+		this.#fullOutput = new BoundedStreamingOutput(DEFAULT_MAX_BYTES);
+		this.#fullOutput.append(clean);
+		this.#fullOutputLines = undefined;
+		this.#outputLines = this.#getFullOutputLines().slice(-STREAMING_PREVIEW_LINE_CAP);
 	}
 
 	#getFullOutputLines(): string[] {
 		if (this.#fullOutputLines === undefined) {
-			const fullOutput = this.#getFullOutput();
+			const fullOutput = this.#fullOutput.text();
 			this.#fullOutputLines = fullOutput ? this.#clampLinesPreservingSixel(fullOutput.split("\n")) : [];
 		}
 		return this.#fullOutputLines;

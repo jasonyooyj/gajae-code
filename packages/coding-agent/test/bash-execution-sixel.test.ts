@@ -3,6 +3,7 @@ import { BashExecutionComponent } from "@gajae-code/coding-agent/modes/component
 import { IrcSplitViewComponent } from "@gajae-code/coding-agent/modes/components/irc-sidebar";
 import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
 import { getThemeByName, setThemeInstance, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-output";
 import { sanitizeWithOptionalSixelPassthrough } from "@gajae-code/coding-agent/utils/sixel";
 import { ImageProtocol, TERMINAL, type TUI } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
@@ -256,5 +257,17 @@ describe("BashExecutionComponent streaming throttle", () => {
 		expect(output).toContain("streaming_line");
 		// The bounded final snapshot must not replace the complete live stream.
 		expect(output).not.toContain("final_line_1");
+	});
+
+	it("bounds high-volume streams with an explicit retained head and tail", () => {
+		const component = new BashExecutionComponent("test", ui, false);
+		component.appendOutput(`HEAD\n${"middle-line\n".repeat(DEFAULT_MAX_BYTES)}TAIL`);
+		component.setComplete(0, false);
+
+		const output = component.getOutput();
+		expect(output).toContain("HEAD");
+		expect(output).toContain("TAIL");
+		expect(output).toContain("elided");
+		expect(Buffer.byteLength(output, "utf-8")).toBeLessThan(DEFAULT_MAX_BYTES + 1024);
 	});
 });

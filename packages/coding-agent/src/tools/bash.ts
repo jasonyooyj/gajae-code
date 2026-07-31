@@ -761,11 +761,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const label = options.command.length > 120 ? `${options.command.slice(0, 117)}...` : options.command;
 		let latestText = "";
 		let backgrounded = options.startBackgrounded;
-		const runningDetails = (jobId: string): Record<string, unknown> | undefined =>
+		const runningDetails = (jobId: string): BashToolDetails | undefined =>
 			backgrounded ? { async: { state: "running", jobId, type: "bash" } } : undefined;
-		const completedDetails = (jobId: string): Record<string, unknown> | undefined =>
+		const completedDetails = (jobId: string): BashToolDetails | undefined =>
 			backgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined;
-		const failedDetails = (jobId: string): Record<string, unknown> | undefined =>
+		const failedDetails = (jobId: string): BashToolDetails | undefined =>
 			backgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 
@@ -778,39 +778,51 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const spillThreshold = resolveBashOutputSinkTailBytes(this.session.settings);
 				const headBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 				const tailBuffer = new TailBuffer(spillThreshold);
+				const streamUpdates = createStreamOutputUpdates<BashToolDetails>(
+					tailBuffer,
+					update => {
+						const text = this.#extractTextResult(update);
+						latestText = text;
+						void reportProgress(text, {
+							...(runningDetails(jobId) ?? {}),
+							...(update.details ?? {}),
+						});
+					},
+					text => ({ streamingOutput: { kind: "append", text } }),
+				);
 
 				let executionResult: BashResult | BashInteractiveResult | undefined;
 				try {
-					const result = await executeBash(options.command, {
-						cwd: options.commandCwd,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
-						timeout: options.timeoutMs,
-						signal: runSignal,
-						env: options.resolvedEnv,
-						artifactPath,
-						artifactId,
-						artifactPublisher,
-						spillThreshold,
-						headBytes,
-						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
-						onChunk: chunk => {
-							tailBuffer.append(chunk);
-							latestText = tailBuffer.text();
-							void reportProgress(latestText, runningDetails(jobId));
-						},
-						onRawChunk: chunk => {
-							// Forward the unthrottled sanitized chunk to the async-job
-							// substrate so the Monitor tool can read the complete process
-							// stream by byte offset, independent of the throttled preview
-							// path above.
-							manager.appendOutput(jobId, chunk);
-						},
-						onMinimizedSave: async originalText => {
-							return saveBashOriginalArtifact(this.session, originalText);
-						},
-					});
+					let result: BashResult | BashInteractiveResult;
+					try {
+						result = await executeBash(options.command, {
+							cwd: options.commandCwd,
+							sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+							timeout: options.timeoutMs,
+							signal: runSignal,
+							env: options.resolvedEnv,
+							artifactPath,
+							artifactId,
+							artifactPublisher,
+							spillThreshold,
+							headBytes,
+							oneShot: true,
+							ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
+							disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+							onChunk: streamUpdates.onChunk,
+							onRawChunk: chunk => {
+								// Preserve the Monitor byte stream and independently forward
+								// append-only renderer deltas for foreground tool expansion.
+								manager.appendOutput(jobId, chunk);
+								streamUpdates.onRawChunk(chunk);
+							},
+							onMinimizedSave: async originalText => {
+								return saveBashOriginalArtifact(this.session, originalText);
+							},
+						});
+					} finally {
+						streamUpdates.flush();
+					}
 					executionResult = result;
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -836,7 +848,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					latestText = text;
 					await options.onUpdate?.({
 						content: [{ type: "text", text }],
-						details: backgrounded ? ((details ?? {}) as BashToolDetails) : {},
+						details: (details ?? {}) as BashToolDetails,
 					});
 				},
 			},

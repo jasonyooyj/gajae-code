@@ -4,6 +4,7 @@ import { type IrcSidebarTheme, IrcSplitViewComponent } from "@gajae-code/coding-
 import { ToolExecutionComponent } from "@gajae-code/coding-agent/modes/components/tool-execution";
 import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observation-ledger";
 import * as themeModule from "@gajae-code/coding-agent/modes/theme/theme";
+import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-output";
 import { ImageProtocol, TERMINAL, type TUI } from "@gajae-code/tui";
 
 beforeAll(async () => {
@@ -108,6 +109,30 @@ it("keeps the complete streamed bash output available after the final result is 
 	const rendered = Bun.stripANSI(component.render(120).join("\n"));
 	expect(rendered).toContain("stream-line-1");
 	expect(rendered).toContain("stream-line-30");
+});
+
+it("bounds expanded streamed bash output while retaining both ends", () => {
+	const component = new ToolExecutionComponent("bash", { command: "emit lots" }, {}, undefined, uiStub);
+	const fullOutput = `HEAD\n${"middle-line\n".repeat(DEFAULT_MAX_BYTES)}TAIL`;
+
+	component.updateResult(
+		{
+			content: [{ type: "text", text: "TAIL" }],
+			details: { streamingOutput: { kind: "append", text: fullOutput } },
+		},
+		true,
+	);
+	component.updateResult({ content: [{ type: "text", text: "TAIL" }], isError: false }, false);
+	component.setExpanded(true);
+
+	const renderedLines = component.render(120).map(line => Bun.stripANSI(line));
+	const rendered = renderedLines.join("\n");
+	expect(rendered).toContain("HEAD");
+	expect(rendered).toContain("TAIL");
+	expect(rendered).toContain("elided");
+	// Box rendering pads each line to the terminal width, so line count is the
+	// stable bound for the retained 50KB head/tail projection.
+	expect(renderedLines.length).toBeLessThanOrEqual(Math.ceil(DEFAULT_MAX_BYTES / "middle-line\n".length) + 16);
 });
 
 it("replaces generic SIXEL output while the IRC sidebar is visible and restores passthrough when hidden", () => {
